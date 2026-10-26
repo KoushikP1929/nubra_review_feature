@@ -23,10 +23,10 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">
+      <body className="min-h-full flex flex-col bg-white text-slate-900">
         {children}
-        <footer className="border-t border-zinc-200 py-6 dark:border-zinc-800">
-          <p className="mx-auto w-full max-w-6xl px-6 text-xs text-zinc-500 dark:text-zinc-500">
+        <footer className="border-t border-zinc-200 py-6">
+          <p className="mx-auto w-full max-w-6xl px-6 text-xs text-zinc-500">
             Nubra Trade Review — prototype. Sample data only; no live broker or
             Nubra API integration. All analytics are calculated by the backend.
           </p>
