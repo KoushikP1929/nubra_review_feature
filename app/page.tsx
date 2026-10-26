@@ -24,6 +24,10 @@ import {
 
 type HomeProps = { searchParams: Promise<{ month?: string }> };
 
+// This screen renders live, per-request backend data (headers, searchParams,
+// uncached fetch) — it must not be prerendered.
+export const instant = false;
+
 export default async function Home({ searchParams }: HomeProps) {
   const { month: requestedMonth } = await searchParams;
 

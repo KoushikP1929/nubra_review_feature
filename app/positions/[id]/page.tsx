@@ -21,6 +21,10 @@ import {
 
 type PositionPageProps = { params: Promise<{ id: string }> };
 
+// This screen renders live, per-request backend data (params, uncached
+// fetch) — it must not be prerendered.
+export const instant = false;
+
 export default async function PositionDetailPage({
   params,
 }: PositionPageProps) {
