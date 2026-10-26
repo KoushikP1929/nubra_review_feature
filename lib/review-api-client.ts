@@ -174,10 +174,10 @@ export function signedMoney(n: number): string {
 
 export function pnlColorClass(n: number): string {
   return n > 0
-    ? "text-emerald-600 dark:text-emerald-400"
+    ? "text-emerald-600"
     : n < 0
-      ? "text-red-600 dark:text-red-400"
-      : "text-zinc-600 dark:text-zinc-400";
+      ? "text-red-600"
+      : "text-zinc-600";
 }
 
 export function monthLabel(ym: string): string {
