@@ -25,18 +25,21 @@ export type AnalyticsResponse = {
   netPnl: number;
   winRate: number | null;
   completedPositions: number;
+  profitCount: number;
+  lossCount: number;
   avgPnlPerTrade: number | null;
 };
 
 export type DailyPnlResponse = {
   dataSource: string;
   month: string;
-  days: { date: string; netPnl: number; trades: number }[];
+  days: { date: string; netPnl: number; cumulativePnl: number; trades: number }[];
 };
 
 export type PositionSummary = {
   id: string;
   instrument: string;
+  instrumentType: string;
   side: "long" | "short" | string;
   quantity: number;
   openedAt: string;
@@ -90,11 +93,13 @@ export type PositionDetailResponse = {
   position: {
     id: string;
     instrument: string;
+    instrumentType: string;
     side: "long" | "short" | string;
     quantity: number;
     status: string;
     openedAt: string;
     closedAt: string;
+    plannedStop: number | null;
     realizedPnl: number;
     feesTotal: number;
     holdDurationMinutes: number;
@@ -103,6 +108,12 @@ export type PositionDetailResponse = {
   exit: TradeLeg | null;
   orders: OrderRow[];
   executions: ExecutionRow[];
+  priceMovePct: number | null;
+  stopBreached: boolean;
+  narrative: string[];
+  evidence: string[];
+  timeline: { time: string; title: string; lines: string[] }[];
+  reflectionPrompt: string;
   observations: {
     note: string;
     facts: { fact: string; value: string; evidence: string }[];
@@ -151,7 +162,7 @@ export function backendErrorMessage(status: number, path: string): string {
 // ---------------------------------------------------------------------------
 
 export function money(n: number): string {
-  return n.toLocaleString("en-US", {
+  return "₹" + n.toLocaleString("en-IN", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });

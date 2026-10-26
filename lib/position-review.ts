@@ -2,7 +2,7 @@
  * Nubra Trade Review — backend data layer (shared by all API routes).
  *
  * Responsibilities:
- *  - Validate API inputs (calendar month, position id).
+ *  - Validate API inputs (calendar month, position id, list filters).
  *  - Run parameterized raw SQL against the Neon PostgreSQL database
  *    (@neondatabase/serverless HTTP driver — no ORM).
  *  - Compute ALL review analytics from stored facts at request time.
@@ -14,6 +14,11 @@
  *    Break-even positions (P&L = 0) count as neither win nor loss.
  *  - Monetary figures and win rate are rounded to 2 decimals.
  *  - Daily P&L groups positions by the UTC calendar day of `closed_at`.
+ *  - The "exit beyond planned stop" check compares the exit fill price
+ *    with the stored planned_stop for the trade's direction — reported
+ *    as an observable fact, never as a judgement of the decision.
+ *  - The trade-review timeline and "What happened" narrative are built
+ *    ONLY from stored, observable records (orders, fills, stop, times).
  *
  * Typing note: in this driver version `sql.query()` has no row-type generic
  * — it returns rows as Record<string, any>[]. Each function therefore
@@ -50,6 +55,15 @@ function round2(n: number): number {
 
 function toIso(v: unknown): string {
   return new Date(v as string | number).toISOString();
+}
+
+function hhmm(v: unknown): string {
+  return toIso(v).slice(11, 16);
+}
+
+function cap(v: unknown): string {
+  const s = String(v);
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
 /** Validate and normalize a `YYYY-MM` path segment, or a 400-style error. */
@@ -124,6 +138,8 @@ export async function getMonthlyAnalytics(range: MonthRange): Promise<Response> 
     netPnl,
     winRate: count === 0 ? null : round2((wins / count) * 100),
     completedPositions: count,
+    profitCount: wins,
+    lossCount: pnls.filter((p) => p < 0).length,
     avgPnlPerTrade: count === 0 ? null : round2(netPnl / count),
   });
 }
@@ -143,28 +159,74 @@ export async function getDailyPnl(range: MonthRange): Promise<Response> {
      ORDER BY day`,
     [range.startIso, range.endIso],
   )) as Row[];
+  // Backend-computed running total (cumulative P&L) across the sorted days.
+  let cumulative = 0;
   return Response.json({
     dataSource: DATA_SOURCE,
     month: range.month,
-    days: rows.map((r) => ({
-      date: String(r.day),
-      netPnl: round2(Number(r.net_pnl)),
-      trades: Number(r.trades),
-    })),
+    days: rows.map((r) => {
+      const netPnl = round2(Number(r.net_pnl));
+      cumulative = round2(cumulative + netPnl);
+      return {
+        date: String(r.day),
+        netPnl,
+        cumulativePnl: cumulative,
+        trades: Number(r.trades),
+      };
+    }),
   });
 }
 
 // -------------------------------------------------------------------------
-// Endpoint 4 — GET /api/months/[month]/positions
+// Endpoint 4 — GET /api/months/[month]/positions?outcome=&q=
 // -------------------------------------------------------------------------
 
-export async function getMonthlyPositions(range: MonthRange): Promise<Response> {
+/**
+ * Validate the optional query filters accepted by GET
+ * /api/months/[month]/positions?outcome=…&q=… . Anchored in the backend so
+ * the frontend never filters, sorts, or calculates anything.
+ */
+export type PositionFilters = { outcome: "profit" | "loss" | undefined; search: string | undefined };
+
+export function parsePositionFilters(searchParams: URLSearchParams): PositionFilters | Response {
+  const outcomeParam = searchParams.get("outcome") ?? undefined;
+  if (outcomeParam !== undefined && outcomeParam !== "profit" && outcomeParam !== "loss") {
+    return apiError(
+      "Invalid outcome filter. Expected 'profit' or 'loss'.",
+      400,
+    );
+  }
+  const qParam = (searchParams.get("q") ?? "").trim() || undefined;
+  let searchArg: string | undefined;
+  if (qParam !== undefined) {
+    // Only instrument names and trade direction are searchable; escape SQL
+    // wildcards so user input cannot scan other columns.
+    searchArg = qParam.replace(/[^a-zA-Z0-9 .-]/g, "").replace(/[%_]/g, "");
+    if (searchArg.length === 0) searchArg = undefined;
+  }
+  return { outcome: outcomeParam as PositionFilters["outcome"], search: searchArg };
+}
+
+export async function getMonthlyPositions(range: MonthRange, filters: PositionFilters): Promise<Response> {
+  const clauses = [
+    "closed_at >= $1",
+    "closed_at < $2",
+    "status = 'closed'",
+  ];
+  const params: unknown[] = [range.startIso, range.endIso];
+  if (filters.outcome === "profit") clauses.push("realized_pnl > 0");
+  if (filters.outcome === "loss") clauses.push("realized_pnl < 0");
+  if (filters.search) {
+    const idx = params.length + 1;
+    clauses.push(`(instrument ILIKE $${idx} OR side ILIKE $${idx})`);
+    params.push(`%${filters.search}%`);
+  }
   const rows = (await sql.query(
-    `SELECT id, instrument, side, quantity, opened_at, closed_at, realized_pnl, fees_total, status
+    `SELECT id, instrument, instrument_type, side, quantity, opened_at, closed_at, realized_pnl, fees_total, status
      FROM positions
-     WHERE closed_at >= $1 AND closed_at < $2 AND status = 'closed'
+     WHERE ${clauses.join(" AND ")}
      ORDER BY closed_at DESC`,
-    [range.startIso, range.endIso],
+    params,
   )) as Row[];
   return Response.json({
     dataSource: DATA_SOURCE,
@@ -172,6 +234,7 @@ export async function getMonthlyPositions(range: MonthRange): Promise<Response> 
     positions: rows.map((r) => ({
       id: String(r.id),
       instrument: String(r.instrument),
+      instrumentType: String(r.instrument_type),
       side: String(r.side),
       quantity: Number(r.quantity),
       openedAt: toIso(r.opened_at),
@@ -188,20 +251,15 @@ export async function getMonthlyPositions(range: MonthRange): Promise<Response> 
 // -------------------------------------------------------------------------
 
 /**
- * Evidence-backed observations are computed ONLY from stored, observable
- * facts (hold duration, fees, this outcome vs. the month's data). They do
- * not claim to explain trader intent. Improvement prompts are general
- * review questions — the backend cannot and does not infer intent.
+ * Evidence-backed observations and the "What happened" narrative are
+ * computed ONLY from stored, observable facts (orders, fills, planned stop,
+ * times). They do not claim to explain trader intent. The reflection
+ * prompt is a general review question — the backend cannot and does not
+ * infer intent.
  */
-const IMPROVEMENT_PROMPTS = [
-  "Before opening the next position of this type, what was your exit plan, and how will you check it before entering?",
-  "Was the position size consistent with the risk you intended to take on this trade?",
-  "Based on the hold duration shown above, did the actual timeframe match what you planned for this trade?",
-];
-
 export async function getPositionDetail(id: string): Promise<Response> {
   const positionRows = (await sql.query(
-    "SELECT id, instrument, side, quantity, status, opened_at, closed_at, realized_pnl, fees_total FROM positions WHERE id = $1",
+    "SELECT id, instrument, instrument_type, side, quantity, status, opened_at, closed_at, planned_stop, realized_pnl, fees_total FROM positions WHERE id = $1",
     [id],
   )) as Row[];
   if (positionRows.length === 0) {
@@ -218,12 +276,19 @@ export async function getPositionDetail(id: string): Promise<Response> {
     [id],
   )) as Row[];
 
-  // The dataset's agreed shape is one entry order + one exit order, each
-  // with one execution, in ascending time order.
-  const entryOrder = orders[0];
-  const exitOrder = orders[orders.length - 1];
-  const entryExec = executions.find((e) => e.order_id === entryOrder?.id);
+  const side = String(p.side);
+  const entrySide = side === "long" ? "buy" : "sell";
+  const exitSide = side === "long" ? "sell" : "buy";
+
+  const entryOrders = orders.filter((o) => o.side === entrySide);
+  const exitOrder = orders.find((o) => o.side === exitSide) ?? orders[orders.length - 1];
+  const entryExecs = executions.filter((e) => e.side === entrySide);
   const exitExec = executions.find((e) => e.order_id === exitOrder?.id);
+
+  const firstEntryOrder = entryOrders[0];
+  const firstEntryExec = entryExecs[0];
+  const entryPrice =
+    firstEntryExec != null ? Number(firstEntryExec.price) : null;
 
   const openedAt = toIso(p.opened_at);
   const closedAt = toIso(p.closed_at);
@@ -231,16 +296,112 @@ export async function getPositionDetail(id: string): Promise<Response> {
     (new Date(closedAt).getTime() - new Date(openedAt).getTime()) / 60000,
   );
   const realizedPnl = round2(Number(p.realized_pnl));
+  const feesTotal = round2(Number(p.fees_total));
 
-  const month = closedAt.slice(0, 7);
-  const avgRows = (await sql.query(
-    "SELECT AVG(realized_pnl) AS avg_pnl FROM positions WHERE closed_at >= $1 AND closed_at < $2 AND status = 'closed'",
-    [`${month}-01T00:00:00Z`, nextMonthIso(month)],
-  )) as Row[];
-  const monthAvg =
-    avgRows.length > 0 && avgRows[0].avg_pnl != null
-      ? Number(avgRows[0].avg_pnl)
+  const plannedStop =
+    p.planned_stop == null ? null : round2(Number(p.planned_stop));
+  const exitPrice = exitExec != null ? Number(exitExec.price) : null;
+
+  // Observable fact: exit beyond the recorded planned stop.
+  const stopBreached =
+    plannedStop != null &&
+    exitPrice != null &&
+    (side === "long" ? exitPrice < plannedStop : exitPrice > plannedStop);
+
+  // Observable fact: % price move entry → exit (not flipped to the P&L sign).
+  const priceMovePct =
+    exitPrice != null && entryPrice != null && entryPrice !== 0
+      ? round2(((exitPrice - entryPrice) / entryPrice) * 100)
       : null;
+
+  const additionCount = entryOrders.length - 1;
+
+  // ---- Execution timeline (chronological, from stored records only) -------
+  type TimelineItem = { time: string; title: string; lines: string[] };
+  const timeline: TimelineItem[] = [];
+  if (plannedStop != null) {
+    timeline.push({
+      time: openedAt,
+      title: "Planned stop recorded",
+      lines: [`Planned stop noted at ₹${plannedStop.toFixed(2)}`],
+    });
+  }
+  for (const o of orders) {
+    const isEntryAddition = o.side === entrySide && String(o.id) !== String(firstEntryOrder?.id);
+    const placedTitle = o.side === exitSide ? "Exit placed" : "Order placed";
+    const fillTitle = o.side === exitSide
+      ? "Exit filled"
+      : isEntryAddition
+        ? "Position added"
+        : "Order filled";
+    const fill = executions.find((e) => e.order_id === o.id);
+    timeline.push({
+      time: toIso(o.created_at),
+      title: placedTitle,
+      lines: [
+        `${cap(o.side)} ${String(o.order_type)} order for ${Number(o.quantity)} @ ₹${fill != null ? Number(fill.price).toFixed(2) : "—"}`,
+      ],
+    });
+    if (fill) {
+      timeline.push({
+        time: toIso(fill.executed_at),
+        title: fillTitle,
+        lines: [
+          `${Number(fill.quantity)} units filled @ ₹${Number(fill.price).toFixed(2)}`,
+          ...(isEntryAddition
+            ? [`Total position now ${Number(p.quantity)} units`]
+            : []),
+        ],
+      });
+    }
+  }
+  timeline.sort(
+    (a, b) => new Date(a.time).getTime() - new Date(b.time).getTime(),
+  );
+
+  // ---- "What happened" narrative (facts only) -----------------------------
+  const sentence1 =
+    `${cap(side)} position in ${String(p.instrument)} opened at ${hhmm(p.opened_at)} and closed at ${hhmm(p.closed_at)} after ${holdMinutes} minutes.`;
+  const sentence2 =
+    priceMovePct == null
+      ? `The recorded exit price is not available; realized P&L for the review period is ₹${realizedPnl.toFixed(2)}.`
+      : `Price moved ${priceMovePct > 0 ? "+" : ""}${priceMovePct}% from entry, resulting in a ${realizedPnl >= 0 ? "profit" : "loss"} of ₹${Math.abs(realizedPnl).toFixed(2)} after ₹${feesTotal.toFixed(2)} fees.`;
+  const sentence3 =
+    additionCount > 0
+      ? `Size was increased ${additionCount === 1 ? "once" : `${additionCount} times`} during the trade${additionCount === 1 ? "" : "s"}.`
+      : null;
+  const narrative = [sentence1, sentence2, ...(sentence3 ? [sentence3] : [])];
+
+  // ---- Evidence bullets (each traceable to stored data) -------------------
+  const evidence: string[] = [];
+  if (entryPrice != null && exitPrice != null) {
+    evidence.push(
+      `Entry ₹${entryPrice.toFixed(2)} → exit ₹${exitPrice.toFixed(2)} (${priceMovePct != null ? (priceMovePct > 0 ? "+" : "") + priceMovePct + "%" : "n/a"})`,
+    );
+  }
+  evidence.push(`Holding time: ${holdMinutes} min`);
+  if (plannedStop != null) {
+    evidence.push(
+      stopBreached
+        ? `Planned stop ₹${plannedStop.toFixed(2)} — exit occurred beyond the recorded stop`
+        : `Planned stop ₹${plannedStop.toFixed(2)} — exit stayed within the recorded stop`,
+    );
+  }
+  if (additionCount > 0) {
+    evidence.push(
+      `Position scaled from ${Number(firstEntryOrder?.quantity)} to ${Number(p.quantity)} units`,
+    );
+  }
+
+  // ---- Reflection prompt --------------------------------------------------
+  const GENERIC_PROMPTS = [
+    "What was your exit plan when you opened this position, and how will you check it before entering the next trade?",
+    "Was the position size consistent with the risk you intended to take on this trade?",
+    "Based on the hold duration shown above, did the actual timeframe match what you planned for this trade?",
+  ];
+  const reflectionPrompt = stopBreached
+    ? "What happened between the stop level being reached and the exit fill? Was the plan updated, and if so, was that intentional?"
+    : GENERIC_PROMPTS[0];
 
   const leg = (o: Row | undefined, e: Row | undefined) =>
     !o || !e
@@ -262,16 +423,18 @@ export async function getPositionDetail(id: string): Promise<Response> {
     position: {
       id: String(p.id),
       instrument: String(p.instrument),
-      side: String(p.side),
+      instrumentType: String(p.instrument_type),
+      side,
       quantity: Number(p.quantity),
       status: String(p.status),
       openedAt,
       closedAt,
+      plannedStop,
       realizedPnl,
-      feesTotal: round2(Number(p.fees_total)),
+      feesTotal: feesTotal,
       holdDurationMinutes: holdMinutes,
     },
-    entry: leg(entryOrder, entryExec),
+    entry: leg(firstEntryOrder, firstEntryExec),
     exit: leg(exitOrder, exitExec),
     orders: orders.map((o) => ({
       id: String(o.id),
@@ -292,6 +455,12 @@ export async function getPositionDetail(id: string): Promise<Response> {
       fees: Number(e.fees),
       executedAt: toIso(e.executed_at),
     })),
+    priceMovePct,
+    stopBreached,
+    narrative,
+    evidence,
+    timeline,
+    reflectionPrompt,
     observations: {
       note: "Observations are computed only from stored, observable data. They do not explain the trader's intent.",
       facts: [
@@ -302,31 +471,26 @@ export async function getPositionDetail(id: string): Promise<Response> {
         },
         {
           fact: "Fees paid on this position",
-          value: Number(p.fees_total).toFixed(2),
-          evidence: "Sum of the stored execution fees (entry + exit).",
+          value: feesTotal.toFixed(2),
+          evidence: "Sum of the stored execution fees (entry, additions and exit).",
         },
-        ...(monthAvg == null
+        ...(plannedStop == null
           ? []
           : [
               {
-                fact: "Outcome vs. average position of its month",
-                value: round2(realizedPnl - monthAvg).toFixed(2),
+                fact: "Planned stop",
+                value: stopBreached
+                  ? `₹${plannedStop.toFixed(2)} (exit occurred beyond it)`
+                  : `₹${plannedStop.toFixed(2)} (exit stayed within it)`,
                 evidence:
-                  "This position's realized P&L minus the average realized P&L of all completed positions in its month.",
+                  "The stop stored with the position compared with the recorded exit fill price.",
               },
             ]),
       ],
     },
     improvementPrompts: {
       note: "General review questions, not data-derived conclusions.",
-      prompts: IMPROVEMENT_PROMPTS,
+      prompts: GENERIC_PROMPTS,
     },
   });
-}
-
-function nextMonthIso(month: string): string {
-  const first = new Date(`${month}-01T00:00:00Z`);
-  const next = new Date(first);
-  next.setUTCMonth(next.getUTCMonth() + 1);
-  return next.toISOString();
 }
